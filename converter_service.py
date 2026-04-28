@@ -5,10 +5,8 @@ Chamado pelo n8n via HTTP Request node
 
 import io
 import os
-import tempfile
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Literal
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -18,7 +16,7 @@ from PIL import Image
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PDF to ZPL Converter", version="2.0.0")
+app = FastAPI(title="PDF to ZPL Converter", version="2.1.0")
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 4))
 
@@ -27,8 +25,10 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", 4))
 # ──────────────────────────────────────────
 
 def pagina_para_zpl(doc: fitz.Document, page_idx: int, width_inches: float, height_inches: float) -> str:
-    """Converte uma página do PDF diretamente para ZPL (sem PNG intermediário)."""
+    """Converte uma página do PDF diretamente para ZPL, forçando o tamanho correto."""
     dpi = 203  # DPI padrão de impressoras Zebra
+    target_width = int(width_inches * dpi)
+    target_height = int(height_inches * dpi)
 
     page = doc[page_idx]
 
@@ -36,8 +36,15 @@ def pagina_para_zpl(doc: fitz.Document, page_idx: int, width_inches: float, heig
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
 
-    # Converte para imagem PIL para aplicar dithering Floyd-Steinberg
+    # Converte para imagem PIL
     img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+
+    # Redimensiona para o tamanho exato da etiqueta configurada
+    if img.size != (target_width, target_height):
+        logger.info(f"  Redimensionando página {page_idx} de {img.size} para ({target_width}, {target_height})")
+        img = img.resize((target_width, target_height), Image.LANCZOS)
+
+    # Converte para 1-bit com dithering Floyd-Steinberg
     img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
 
     width, height = img.size
@@ -68,11 +75,7 @@ def pagina_para_zpl(doc: fitz.Document, page_idx: int, width_inches: float, heig
     )
 
 
-def pdf_para_zpl(
-    pdf_bytes: bytes,
-    width_inches: float,
-    height_inches: float,
-) -> str:
+def pdf_para_zpl(pdf_bytes: bytes, width_inches: float, height_inches: float) -> str:
     """
     Converte todas as páginas do PDF para um único arquivo ZPL.
     Usa processamento paralelo para velocidade máxima.
@@ -82,7 +85,6 @@ def pdf_para_zpl(
 
     logger.info(f"Convertendo {n_pages} páginas | {width_inches}x{height_inches} pol | {MAX_WORKERS} workers")
 
-    # Processa páginas em paralelo
     resultados: dict[int, str] = {}
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -127,13 +129,13 @@ async def convert(
 
     Uso no n8n:
       - Method: POST
-      - URL: http://pdf-converter:8000/convert
+      - URL: http://n8n_webco_pdf-converter:8000/convert
       - Body: Form Data
           file: [binary do PDF]
-          width_inches: 7
-          height_inches: 5
+          width_inches: 7  (ou 10)
+          height_inches: 5  (ou 15)
     """
-    if not file.filename.endswith(".pdf"):
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Apenas arquivos .pdf são aceitos")
 
     pdf_bytes = await file.read()
@@ -141,7 +143,7 @@ async def convert(
     if len(pdf_bytes) == 0:
         raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-    logger.info(f"Recebido: {file.filename} ({len(pdf_bytes) / 1024 / 1024:.1f} MB)")
+    logger.info(f"Recebido: {file.filename} ({len(pdf_bytes) / 1024 / 1024:.1f} MB) | {width_inches}x{height_inches} pol")
 
     try:
         zpl_content = pdf_para_zpl(pdf_bytes, width_inches, height_inches)
@@ -159,14 +161,18 @@ async def convert(
 
 
 @app.post("/convert/info")
-async def convert_info(
-    file: UploadFile = File(...),
-):
+async def convert_info(file: UploadFile = File(...)):
     """Retorna info do PDF sem converter (útil para debug no n8n)."""
     pdf_bytes = await file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    rect = page.rect
     return JSONResponse({
         "filename": file.filename,
         "pages": len(doc),
         "size_mb": round(len(pdf_bytes) / 1024 / 1024, 2),
+        "page_width_pt": round(rect.width, 1),
+        "page_height_pt": round(rect.height, 1),
+        "page_width_inches": round(rect.width / 72, 2),
+        "page_height_inches": round(rect.height / 72, 2),
     })
